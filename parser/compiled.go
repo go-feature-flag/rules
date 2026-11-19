@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -10,6 +11,10 @@ import (
 )
 
 type nodeKind int
+
+// inSetMinLen is the list length from which IN uses a hash set instead of a
+// linear scan. Below it the scan is as fast and the set only costs memory.
+const inSetMinLen = 64
 
 const (
 	nodeParen nodeKind = iota
@@ -60,6 +65,8 @@ type compareNode struct {
 	rightOp  Operand // valueConst: operand set for the rule value
 	valErr   error   // valueConst: error set on eval (invalid integer)
 	listErr  error   // lists: parse error of the first bad element; the list then holds the elements before it
+	strSet   *strSet // long string lists: the packed list and its hash index, used by IN; listOp is nil then
+	intSet   *intSet // long int lists: hash index over listOp, used by IN
 	listOp   Operand // lists: the parsed list ([]int, []float64 or []string)
 }
 
@@ -189,7 +196,7 @@ func (n *node) eval(st *evalState) bool {
 
 func (n *compareNode) setRight(st *evalState) {
 	if n.valKind != valueConst && n.listErr == nil && st.rightOp == nil {
-		st.rightOp = n.listOp
+		st.rightOp = n.listValue()
 		return
 	}
 	switch n.valKind {
@@ -222,7 +229,7 @@ func (n *compareNode) setRight(st *evalState) {
 		} else {
 			list = st.rightOp.([]string)
 		}
-		st.rightOp = append(list, n.listOp.([]string)...)
+		st.rightOp = append(list, n.listValue().([]string)...)
 	default:
 		st.rightOp = n.rightOp
 		if n.valErr != nil {
@@ -233,6 +240,11 @@ func (n *compareNode) setRight(st *evalState) {
 
 func (n *compareNode) evalCompare(st *evalState) bool {
 	st.resolve(n.path)
+	if n.strSet != nil || n.intSet != nil {
+		if r, ok := n.setIN(st); ok {
+			return r
+		}
+	}
 	n.setRight(st)
 	if st.err != nil {
 		return false
@@ -257,6 +269,44 @@ func (n *compareNode) evalCompare(st *evalState) bool {
 	}
 	st.rightOp = nil
 	return ret
+}
+
+// listValue returns the parsed list as an operand. A packed long string
+// list is expanded into a fresh []string; that only happens off the hash
+// lookup path (errors, stale operands, operators other than IN).
+func (n *compareNode) listValue() Operand {
+	if n.strSet != nil {
+		return n.strSet.slice()
+	}
+	return n.listOp
+}
+
+// setIN answers IN for long compiled string/int lists with a hash lookup,
+// before the list operand is materialized. It preserves the linear scan's
+// semantics (exact, case-sensitive string equality; int left operand only).
+// It applies only when nothing is pending in the evaluation state (no stale
+// operand, no earlier error) and the left operand passes the same type check;
+// otherwise it reports false and the regular linear path runs, producing the
+// original errors and debug errors.
+func (n *compareNode) setIN(st *evalState) (bool, bool) {
+	if n.opType != JsonQueryParserIN || n.listErr != nil || n.version != nil || st.rightOp != nil || st.err != nil {
+		return false, false
+	}
+	switch {
+	case n.strSet != nil:
+		left, err := (&StringOperation{}).getString(st.leftOp)
+		if err != nil {
+			return false, false
+		}
+		return n.strSet.has(left), true
+	case n.intSet != nil:
+		left, ok := st.leftOp.(int)
+		if !ok {
+			return false, false
+		}
+		return n.intSet.has(left), true
+	}
+	return false, false
 }
 
 func (n *compareNode) setDebugErr(st *evalState, err error) {
@@ -314,14 +364,18 @@ func cloneErr(err error) error {
 }
 
 func compileQuery(tree antlr.ParseTree) *node {
+	return compileTree(tree, &sourceText{})
+}
+
+func compileTree(tree antlr.ParseTree, src *sourceText) *node {
 	switch val := tree.(type) {
 	case *ParenExpContext:
-		return &node{kind: nodeParen, left: compileQuery(val.Query()), not: val.NOT() != nil}
+		return &node{kind: nodeParen, left: compileTree(val.Query(), src), not: val.NOT() != nil}
 	case *LogicalExpContext:
 		return &node{
 			kind:  nodeLogical,
-			left:  compileQuery(val.Query(0)),
-			right: compileQuery(val.Query(1)),
+			left:  compileTree(val.Query(0), src),
+			right: compileTree(val.Query(1), src),
 			isOr:  val.LOGICAL_OPERATOR().GetText() == "or",
 		}
 	case *PresentExpContext:
@@ -330,7 +384,7 @@ func compileQuery(tree antlr.ParseTree) *node {
 		n := newCompareNode(nodeCompare, compileAttrPath(val.AttrPath()))
 		n.attrPath = val.AttrPath().GetText()
 		n.opType = val.op.GetTokenType()
-		op := compileValue(n, val.Value())
+		op := compileValue(n, val.Value(), src)
 		n.apply = applyFor(op, n.opType)
 		if n.apply == nil {
 			panic(fmt.Sprintf("no operation for operator token %d", n.opType))
@@ -511,7 +565,7 @@ func validBuild(s string) bool {
 
 // compileValue pre-parses the right-hand side of a comparison into n and
 // returns the Operation the visitor would have selected for it.
-func compileValue(n *compareNode, v IValueContext) Operation {
+func compileValue(n *compareNode, v IValueContext, src *sourceText) Operation {
 	switch ctx := v.(type) {
 	case *BooleanContext:
 		// the BOOLEAN token only matches true or false, so this cannot fail
@@ -556,6 +610,9 @@ func compileValue(n *compareNode, v IValueContext) Operation {
 			sub = next
 		}
 		n.listOp = ints[:len(ints):len(ints)]
+		if len(ints) >= inSetMinLen && len(ints) < math.MaxUint32 {
+			n.intSet = newIntSet(n.listOp.([]int))
+		}
 		return &IntOperation{}
 	case *ListOfDoublesContext:
 		n.valKind = valueDoubles
@@ -577,14 +634,24 @@ func compileValue(n *compareNode, v IValueContext) Operation {
 		return &FloatOperation{}
 	case *ListOfStringsContext:
 		n.valKind = valueStrings
-		strs := []string{}
+		var tokens []antlr.Token
 		for sub := ctx.ListStrings().SubListOfStrings(); ; {
-			strs = append(strs, getString(sub.STRING().GetText()))
+			tokens = append(tokens, sub.STRING().GetSymbol())
 			next := sub.SubListOfStrings()
 			if next == nil || next.IsEmpty() {
 				break
 			}
 			sub = next
+		}
+		if len(tokens) >= inSetMinLen {
+			if set := newStrSet(tokens, src); set != nil {
+				n.strSet = set
+				return &StringOperation{}
+			}
+		}
+		strs := make([]string, len(tokens))
+		for i, t := range tokens {
+			strs[i] = getString(t.GetText())
 		}
 		n.listOp = strs[:len(strs):len(strs)]
 		return &StringOperation{}
